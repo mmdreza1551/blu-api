@@ -254,10 +254,32 @@ class BluClient {
       const req = sess.request(h);
       let status = 0;
       const chunks = [];
+      let settled = false;
+      // The gateway sometimes goes silent on a reused HTTP/2 session
+      // (no error/close/goaway fires), leaving the request hanging
+      // forever. Fail fast and drop the session so the next call opens
+      // a fresh one instead of hanging the whole server.
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { req.close(); } catch {}
+        try {
+          if (this._h2 === sess) this._h2 = null;
+          sess.destroy();
+        } catch {}
+        reject(new Error('gateway timeout (15s)'));
+      }, 15000);
+      if (timer.unref) timer.unref();
+      const done = (fn) => (...args) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn(...args);
+      };
       req.on('response', (hh) => { status = hh[':status']; });
       req.on('data', (c) => chunks.push(c));
-      req.on('end', () => resolve({ status, body: Buffer.concat(chunks) }));
-      req.on('error', reject);
+      req.on('end', done(() => resolve({ status, body: Buffer.concat(chunks) })));
+      req.on('error', done(reject));
       if (body) req.write(body);
       req.end();
     });
